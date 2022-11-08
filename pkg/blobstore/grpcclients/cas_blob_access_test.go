@@ -28,7 +28,7 @@ func TestCASBlobAccessPut(t *testing.T) {
 
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10)
+	blobAccess := grpcclients.NewCASBlobAccess(client, remoteexecution.Compressor_IDENTITY, uuidGenerator.Call, 10)
 
 	blobDigest := digest.MustNewDigest("hello", "8b1a9953c4611296a827abf8c47804d7", 5)
 	uuid := uuid.Must(uuid.Parse("7d659e5f-0e4b-48f0-ad9f-3489db6e103b"))
@@ -165,7 +165,7 @@ func TestCASBlobAccessGetCapabilities(t *testing.T) {
 
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10)
+	blobAccess := grpcclients.NewCASBlobAccess(client, remoteexecution.Compressor_IDENTITY, uuidGenerator.Call, 10)
 
 	t.Run("BackendFailure", func(t *testing.T) {
 		client.EXPECT().Invoke(

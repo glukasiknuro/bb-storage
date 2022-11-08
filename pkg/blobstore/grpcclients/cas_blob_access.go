@@ -11,6 +11,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/buildbarn/bb-storage/pkg/util"
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc"
@@ -18,6 +19,7 @@ import (
 
 type casBlobAccess struct {
 	byteStreamClient                bytestream.ByteStreamClient
+	compressor                      remoteexecution.Compressor_Value
 	contentAddressableStorageClient remoteexecution.ContentAddressableStorageClient
 	capabilitiesClient              remoteexecution.CapabilitiesClient
 	uuidGenerator                   util.UUIDGenerator
@@ -29,9 +31,10 @@ type casBlobAccess struct {
 // remoteexecution.ContentAddressableStorage services. Those are the
 // services that Bazel uses to access blobs stored in the Content
 // Addressable Storage.
-func NewCASBlobAccess(client grpc.ClientConnInterface, uuidGenerator util.UUIDGenerator, readChunkSize int) blobstore.BlobAccess {
+func NewCASBlobAccess(client grpc.ClientConnInterface, compressor remoteexecution.Compressor_Value, uuidGenerator util.UUIDGenerator, readChunkSize int) blobstore.BlobAccess {
 	return &casBlobAccess{
 		byteStreamClient:                bytestream.NewByteStreamClient(client),
+		compressor:                      compressor,
 		contentAddressableStorageClient: remoteexecution.NewContentAddressableStorageClient(client),
 		capabilitiesClient:              remoteexecution.NewCapabilitiesClient(client),
 		uuidGenerator:                   uuidGenerator,
@@ -61,19 +64,91 @@ func (r *byteStreamChunkReader) Close() {
 	}
 }
 
+// Adapter allowing to read data from ByteStream.Read RPC stream through io.ReadCloser.
+type byteStreamReadCloser struct {
+	client bytestream.ByteStream_ReadClient
+	cancel context.CancelFunc
+	buf    []byte
+}
+
+func (r *byteStreamReadCloser) Read(p []byte) (int, error) {
+	if len(r.buf) == 0 {
+		chunk, err := r.client.Recv()
+		if err != nil {
+			return 0, err
+		}
+		r.buf = chunk.Data
+	}
+
+	copied := copy(p, r.buf)
+
+	r.buf = r.buf[copied:]
+	return copied, nil
+}
+
+func (r *byteStreamReadCloser) Close() error {
+	r.cancel()
+	for {
+		if _, err := r.client.Recv(); err != nil {
+			break
+		}
+	}
+	return nil
+}
+
+// Wrapper around zstd Decoder implementing io.ReadCloser interface.
+// On close releases the zstd decoder and closes the source reader.
+type zstdReaderCloser struct {
+	src io.ReadCloser
+	dec *zstd.Decoder
+}
+
+func (r *zstdReaderCloser) Read(p []byte) (int, error) {
+	return r.dec.Read(p)
+}
+
+func (r *zstdReaderCloser) Close() error {
+	// TODO: Re-use decoders for better performance.
+	r.dec.Close()
+	return r.src.Close()
+}
+
 func (ba *casBlobAccess) Get(ctx context.Context, digest digest.Digest) buffer.Buffer {
 	ctxWithCancel, cancel := context.WithCancel(ctx)
 	client, err := ba.byteStreamClient.Read(ctxWithCancel, &bytestream.ReadRequest{
-		ResourceName: digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY),
+		ResourceName: digest.GetByteStreamReadPath(ba.compressor),
 	})
 	if err != nil {
 		cancel()
 		return buffer.NewBufferFromError(err)
 	}
-	return buffer.NewCASBufferFromChunkReader(digest, &byteStreamChunkReader{
-		client: client,
-		cancel: cancel,
-	}, buffer.BackendProvided(buffer.Irreparable(digest)))
+	if ba.compressor == remoteexecution.Compressor_IDENTITY {
+		return buffer.NewCASBufferFromChunkReader(digest, &byteStreamChunkReader{
+			client: client,
+			cancel: cancel,
+		}, buffer.BackendProvided(buffer.Irreparable(digest)))
+	}
+	if ba.compressor == remoteexecution.Compressor_ZSTD {
+		streamReader := &byteStreamReadCloser{
+			client: client,
+			cancel: cancel,
+		}
+		zstdDecoder, err := zstd.NewReader(streamReader)
+		if err != nil {
+			cancel()
+			return buffer.NewBufferFromError(err)
+		}
+		zstdReader := &zstdReaderCloser{
+			src: streamReader,
+			dec: zstdDecoder,
+		}
+
+		return buffer.NewCASBufferFromReader(
+			digest,
+			zstdReader,
+			buffer.BackendProvided(buffer.Irreparable(digest)))
+	}
+	panic(ba.compressor)
 }
 
 func (ba *casBlobAccess) GetFromComposite(ctx context.Context, parentDigest, childDigest digest.Digest, slicer slicing.BlobSlicer) buffer.Buffer {

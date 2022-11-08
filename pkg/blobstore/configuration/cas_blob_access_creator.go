@@ -1,6 +1,7 @@
 package configuration
 
 import (
+	"fmt"
 	"net/http"
 	"sync"
 
@@ -92,10 +93,15 @@ func (bac *casBlobAccessCreator) NewCustomBlobAccess(configuration *pb.BlobAcces
 		if err != nil {
 			return BlobAccessInfo{}, "", err
 		}
+		compressor := remoteexecution.Compressor_IDENTITY
+		if backend.Grpc.Address == "10.120.0.184:8981" || backend.Grpc.Address == "remote-cache-for-other-clusters:8981" {
+			compressor = remoteexecution.Compressor_ZSTD
+		}
+		fmt.Printf("Using blobAccess backend: %s  compressor: %v\n", backend.Grpc.Address, compressor)
 		// TODO: Should we provide a configuration option, so
 		// that digest.KeyWithoutInstance can be used?
 		return BlobAccessInfo{
-			BlobAccess:      grpcclients.NewCASBlobAccess(client, uuid.NewRandom, 65536),
+			BlobAccess:      grpcclients.NewCASBlobAccess(client, compressor, uuid.NewRandom, 65536),
 			DigestKeyFormat: digest.KeyWithInstance,
 		}, "grpc", nil
 	case *pb.BlobAccessConfiguration_ReferenceExpanding:
